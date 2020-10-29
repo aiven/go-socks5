@@ -2,12 +2,13 @@ package socks5
 
 import (
 	"fmt"
+	"golang.org/x/net/context"
 	"io"
 	"net"
 	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
+	"sync"
+	"time"
 )
 
 const (
@@ -116,7 +117,7 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(req *Request, conn conn) error {
+func (s *Server) handleRequest(req *Request, conn net.Conn) error {
 	ctx := context.Background()
 
 	// Resolve the address if we have a FQDN
@@ -156,7 +157,7 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -188,7 +189,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 		}
 		return fmt.Errorf("Connect to %v failed: %v", req.DestAddr, err)
 	}
-	defer target.Close()
+	//defer target.Close()
 
 	// Send success
 	local := target.LocalAddr().(*net.TCPAddr)
@@ -196,11 +197,12 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	if err := sendReply(conn, successReply, &bind); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-
-	// Start proxying
+	//Start proxying
 	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
+	lock := &sync.Mutex{}
+	go proxy(target, conn, errCh, lock)
+	go proxy(conn, target, errCh, lock)
+
 
 	// Wait
 	for i := 0; i < 2; i++ {
@@ -355,10 +357,57 @@ type closeWriter interface {
 
 // proxy is used to suffle data from src to destination, and sends errors
 // down a dedicated channel
-func proxy(dst io.Writer, src io.Reader, errCh chan error) {
-	_, err := io.Copy(dst, src)
+func ncp (dst net.Conn, src net.Conn) {
+
+}
+
+func proxy(dst net.Conn, src net.Conn, errCh chan error, lock *sync.Mutex) {
+	_, err := copyBuffer(dst, src, lock)
 	if tcpConn, ok := dst.(closeWriter); ok {
 		tcpConn.CloseWrite()
 	}
+	fmt.Println("===============================================================")
 	errCh <- err
+}
+
+func copyBuffer(dst net.Conn, src net.Conn, lock *sync.Mutex) (written int64, err error) {
+	buf := make([]byte, 10)
+
+	for {
+		lock.Lock()
+		_ = src.SetReadDeadline(time.Now().Add(time.Millisecond * 50))
+		nr, er := src.Read(buf)
+		if tiErr, ok := er.(net.Error); ok && tiErr.Timeout() {
+			lock.Unlock()
+			continue
+		}
+		if nr == 21 {
+			fmt.Printf("Banner line from %s: %s\n", src.RemoteAddr().String(), string(buf[0:nr]))
+		}
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				lock.Unlock()
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				lock.Unlock()
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			lock.Unlock()
+			break
+		}
+		lock.Unlock()
+	}
+	return written, err
 }
